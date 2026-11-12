@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * llp-play - minimal MP4 (H.264) player for LiuLianPi / F1C200S.
  *
@@ -16,6 +15,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/fb.h>
+#include <math.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -687,6 +687,8 @@ static int pic_dumped;
 static int use_ldm;
 static int64_t late_limit_us;
 static int rebases;
+static int no_av_servo;
+static int drop_streak;
 static int64_t av_offset_ms;
 static int64_t av_shown;
 static volatile int g_vstarted;
@@ -1624,7 +1626,152 @@ static void audio_write(const int16_t *buf, int frames)
 
 /* Linear resampling, used only when the playback rate is not 1.0.
  * Pitch shifts along with the speed, which is what cheap speed control
- * does; a pitch preserving time stretch is far too heavy for this CPU. */
+ * does when the card cannot give the requested rate. */
+static void audio_write_resampled(const int16_t *pcm, int frames);
+
+/* ------------------------------------------------------------------ */
+/* WSOLA time stretching for slow motion                               */
+/*                                                                     */
+/* Speeding up is free: the PCM rate is raised and the pitch goes up   */
+/* with it, which is what a tape does and what everyone expects.       */
+/* Slowing down is not: halving the rate drops the pitch an octave and */
+/* throws away half the bandwidth, which sounds muddy and unnatural.   */
+/* So below 1.0 the PCM stays at the source rate and the signal is      */
+/* stretched instead, by overlap-adding Hann windowed blocks spliced at */
+/* the point of highest correlation.  Pitch and bandwidth survive.      */
+/*                                                                     */
+/* Costs roughly 1 % CPU - affordable exactly when it is needed,       */
+/* because at 0.5x the video only has to produce 12 fps.               */
+/* ------------------------------------------------------------------ */
+
+#define ST_WIN    1024                  /* ~21 ms at 48 kHz */
+#define ST_HOP    (ST_WIN / 2)          /* 50 % overlap -> exact COLA */
+#define ST_TOL    256                   /* splice search range */
+#define ST_STEP   4                     /* decimation while correlating */
+#define ST_CAP    8192                  /* input buffer, frames */
+
+static int16_t *st_buf;                 /* interleaved input */
+static int      st_len;                 /* frames valid at the front */
+static double   st_pos;                 /* fractional read position */
+static int16_t *st_acc;                 /* ST_WIN frames, accumulator */
+static int16_t *st_hop;                 /* ST_HOP frames of finished output */
+static int16_t  st_win[ST_WIN];
+static int      st_active;
+
+static int st_init(void)
+{
+	int i;
+
+	st_buf = calloc((size_t)ST_CAP * (size_t)audio_ch, sizeof(int16_t));
+	st_acc = calloc((size_t)ST_WIN * (size_t)audio_ch, sizeof(int16_t));
+	st_hop = calloc((size_t)ST_HOP * (size_t)audio_ch, sizeof(int16_t));
+	if (!st_buf || !st_acc || !st_hop)
+		return -1;
+
+	/* Hann, Q15.  With a hop of half the window the overlapping halves
+	 * sum to exactly 32768, so no gain correction is needed beyond the
+	 * >>15 inside st_step(). */
+	for (i = 0; i < ST_WIN; i++)
+		st_win[i] = (int16_t)(16384.0 - 16384.0 *
+				      cos(2.0 * M_PI * (double)i / (double)ST_WIN));
+
+	st_len = 0;
+	st_pos = 0.0;
+	return 0;
+}
+
+static void st_append(const int16_t *pcm, int frames)
+{
+	int ch = audio_ch;
+
+	if (frames <= 0)
+		return;
+
+	if (st_len + frames > ST_CAP) {
+		int drop = st_len + frames - ST_CAP;
+
+		if (drop > st_len)
+			drop = st_len;
+		memmove(st_buf, st_buf + (size_t)drop * (size_t)ch,
+			(size_t)(st_len - drop) * (size_t)ch * sizeof(int16_t));
+		st_len -= drop;
+		st_pos -= (double)drop;
+		if (st_pos < 0.0)
+			st_pos = 0.0;
+	}
+
+	memcpy(st_buf + (size_t)st_len * (size_t)ch, pcm,
+	       (size_t)frames * (size_t)ch * sizeof(int16_t));
+	st_len += frames;
+}
+
+static int st_ready(void)
+{
+	return (int)st_pos + ST_WIN + ST_TOL <= st_len;
+}
+
+static void st_step(void)
+{
+	int ch = audio_ch;
+	int base = (int)st_pos;
+	int best = 0, p, i, c, k;
+	long bestc = -1;
+
+	for (k = -ST_TOL; k <= ST_TOL; k += ST_STEP) {
+		long acc = 0;
+
+		p = base + k;
+		if (p < 0 || p + ST_WIN > st_len)
+			continue;
+		for (i = 0; i < ST_HOP; i += ST_STEP)
+			acc += (long)st_acc[(size_t)i * ch] *
+			       (long)st_buf[(size_t)(p + i) * ch];
+		if (acc > bestc) {
+			bestc = acc;
+			best = k;
+		}
+	}
+
+	p = base + best;
+	if (p < 0)
+		p = 0;
+	if (p + ST_WIN > st_len)
+		p = st_len - ST_WIN;
+
+	for (i = 0; i < ST_WIN; i++) {
+		int32_t w = st_win[i];
+
+		for (c = 0; c < ch; c++)
+			st_acc[(size_t)i * ch + c] =
+				(int16_t)(st_acc[(size_t)i * ch + c] +
+					  (int32_t)(((int32_t)st_buf[(size_t)(p + i) * ch + c] * w) >> 15));
+	}
+
+	memcpy(st_hop, st_acc, (size_t)ST_HOP * (size_t)ch * sizeof(int16_t));
+	memmove(st_acc, st_acc + (size_t)ST_HOP * (size_t)ch,
+		(size_t)(ST_WIN - ST_HOP) * (size_t)ch * sizeof(int16_t));
+	memset(st_acc + (size_t)(ST_WIN - ST_HOP) * (size_t)ch, 0,
+	       (size_t)ST_HOP * (size_t)ch * sizeof(int16_t));
+
+	/* below 1.0 this advances less input per output hop, so the signal
+	 * takes longer to play - with the pitch untouched */
+	st_pos += (double)ST_HOP * play_rate;
+}
+
+static void audio_push(const int16_t *pcm, int frames)
+{
+	if (!st_active) {
+		audio_write_resampled(pcm, frames);
+		return;
+	}
+
+	st_append(pcm, frames);
+	while (st_ready()) {
+		st_step();
+		audio_write(st_hop, ST_HOP);
+	}
+}
+
 static void audio_write_resampled(const int16_t *pcm, int frames)
 {
 	static int16_t *out;
@@ -1686,6 +1833,7 @@ static void *audio_thread(void *arg)
 	NeAACDecConfigurationPtr cfg;
 	unsigned long rate = 0;
 	unsigned char ch = 0;
+	int want = 0;
 	uint8_t *buf;
 	int fd, i;
 
@@ -1720,7 +1868,12 @@ static void *audio_thread(void *arg)
 	printf("audio: aac %lu Hz %d ch, %d access units\n", rate, (int)ch, t->n);
 
 	audio_unmute();
-	if (audio_open((int)((double)rate * play_rate), (int)ch) < 0) {
+	/* Slowing down keeps the source rate and stretches in software;
+	 * speeding up raises the rate and lets the pitch follow. */
+	want = (int)rate;
+	if (play_rate > 1.0)
+		want = (int)((double)rate * play_rate);
+	if (audio_open(want, (int)ch) < 0) {
 		NeAACDecClose(dec);
 		free(buf);
 		close(fd);
@@ -1743,6 +1896,12 @@ static void *audio_thread(void *arg)
 		usleep(5000);
 	printf("audio: synced to video clock\n");
 
+	if (play_rate < 0.999) {
+		st_active = (st_init() == 0);
+		printf("audio: time stretch %.2fx, pitch preserved%s\n",
+		       play_rate, st_active ? "" : " (init failed, falling back)");
+	}
+
 	for (i = 0; i < t->n; i++) {
 		NeAACDecFrameInfo fi;
 		void *pcmbuf;
@@ -1757,8 +1916,8 @@ static void *audio_thread(void *arg)
 			continue;
 		if (fi.channels != (unsigned char)audio_ch)
 			continue;
-		audio_write_resampled((const int16_t *)pcmbuf,
-				      (int)(fi.samples / (unsigned long)audio_ch));
+		audio_push((const int16_t *)pcmbuf,
+			   (int)(fi.samples / (unsigned long)audio_ch));
 	}
 	printf("audio: done, %lld frames\n", (long long)audio_written);
 	audio_done = 1;
@@ -1861,6 +2020,7 @@ int main(int argc, char **argv)
 	half_rows = getenv("LLP_FULL") == NULL;
 	wait_flip = getenv("LLP_BLOCKFLIP") != NULL;
 	use_ldm = getenv("LLP_LDM") != NULL;
+	no_av_servo = getenv("LLP_NOAV") != NULL;
 
 	{
 		const char *r = getenv("LLP_RATE");
@@ -2109,13 +2269,29 @@ int main(int argc, char **argv)
 					 * only works because the wait above is skipped
 					 * as well, so the next frames go through at
 					 * decode speed until we are back on time. */
-					if (now_us() - target > frame_iv) {
+					if (now_us() - target > frame_iv &&
+					    drop_streak < 4) {
 						dropped++;
+						drop_streak++;
 					} else {
+						/* Four frames in a row skipped
+						 * means we simply cannot keep the
+						 * requested rate (1.5x needs
+						 * 22 ms per frame and the decode
+						 * alone costs 17).  Accept the
+						 * lateness instead of freezing:
+						 * the picture then advances at
+						 * whatever the board can do. */
+						if (drop_streak >= 4) {
+							t0 += now_us() - target;
+							rebases++;
+							drop_streak = 0;
+						}
 						int64_t dt0 = now_us();
 
 						draw_frame(pic);
 						draw_us += now_us() - dt0;
+						drop_streak = 0;
 					}
 					{
 						int64_t r0 = now_us();
@@ -2145,7 +2321,8 @@ int main(int argc, char **argv)
 							/* close the loop: nudge the video
 							 * timeline towards the audio clock */
 							av_shown = av_offset_ms;
-							if (av_offset_ms > 100 || av_offset_ms < -100) {
+							if (!no_av_servo &&
+							    (av_offset_ms > 100 || av_offset_ms < -100)) {
 								t0 += av_offset_ms * 1000;
 								av_offset_ms = 0;
 							}

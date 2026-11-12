@@ -215,6 +215,7 @@ llp-play /mnt/sd/clip.mp4
 | `LLP_OUT=565` | use DRM + RGB565 with CPU colour conversion (fallback if the DE YUV path misbehaves) |
 | `LLP_OUT=fb` | use the classic `/dev/fb0` path with software conversion |
 | `LLP_BLOCKFLIP=1` | make page flips block (debugging) |
+| `LLP_NOAV=1` | disable the A/V sync servo (diagnosing speed changes) |
 | `LLP_LDM=1` | load tile rows with LDM bursts (measured: no difference) |
 
 ### 6.2 Stopping playback
@@ -322,9 +323,11 @@ With `package/faad2/0001-enable-fixed-point.patch` applied, the number of soft-f
 
 **This is a general problem**: any faad2 build for a soft-float ARM9 should enable fixed point.
 
-### 8.6 Variable speed: change the PCM rate, do not resample
+### 8.6 Variable speed: two different mechanisms, one per direction
 
-`sun4i-codec` accepts **continuous** rates from 8000 to 192000 Hz (`SNDRV_PCM_RATE_CONTINUOUS`). So changing speed is just `sample_rate × speed`, with the PCM data passed through untouched: no resampling, no CPU cost, no artefacts, only the expected pitch shift.
+`sun4i-codec` accepts **continuous** rates from 8000 to 192000 Hz (`SNDRV_PCM_RATE_CONTINUOUS`), which makes speeding up almost free.
+
+**Speeding up (> 1.0): raise the PCM rate.** The data is passed through untouched, so there is no resampling, no CPU cost and no artefacts - only the pitch rise a tape would give, which is what listeners expect from fast playback.
 
 When the card cannot provide the requested rate (for example 48 kHz × 1.5 = 72 kHz, where it offers 96 kHz), the resampling ratio must be
 
@@ -333,6 +336,14 @@ media samples per device sample = (media rate × speed) / actual rate
 ```
 
 Using the speed itself as the ratio is wrong and makes the audio run at three times speed.
+
+**Slowing down (< 1.0): do not touch the rate at all.** Halving the rate would drop the pitch an octave *and* throw away half the bandwidth, so speech ends up muddy and unnatural. Instead the PCM stays at the source rate and the signal is stretched in software with WSOLA: Hann-windowed 1024-sample blocks, 50 % overlap, each spliced at the offset of highest correlation with the previous block (`st_step()` in `llp-play.c`). Pitch and bandwidth are preserved and it costs about 1 % CPU - affordable exactly when it is needed, because at 0.5× the video only has to produce 12 fps.
+
+### 8.6b Dropping frames must be bounded
+
+Pacing alone is not enough once the requested rate exceeds what the board can do. The first version skipped a frame whenever it was late, and at 1.5× every frame was late every time (`33.3 / 1.5 = 22.2 ms` of budget against `16.6 ms` decode plus conversion), so **every** frame was dropped and the picture froze while the audio kept running.
+
+Dropping is now capped at four consecutive frames, after which the timeline is rebased and a frame is drawn regardless. Playback above the hardware limit then degrades to "show what fits" instead of stopping.
 
 ### 8.7 Audio hiss: the input mixers were being enabled
 
@@ -371,7 +382,7 @@ Without that, manual runs fight an invisible instance over the VE and the CMA po
 
 ## 9. Known limitations
 
-1. **Frames are skipped above 1.5× speed**: `dec 16 ms + conv 22 ms` already fills the 24 fps budget, while 1.5× needs 36 fps of throughput. Audio stays accurate; the picture judders.
+1. **Above 1.5x the picture drops frames**: `dec 16.6 ms` alone eats 75 % of the 22.2 ms budget that 1.5x allows, so only a fraction of the frames can be shown. Audio stays accurate and the picture keeps moving (the drop streak is capped), but 1.5x is beyond what this SoC can render at 1024x600.
 2. **A 24 fps source is close to the limit**: a handful of dropped frames is normal; 30 fps material is worse.
 3. **Tight rootfs**: 7.4 MB of content in a 9.94 MB jffs2 partition.
 4. **`ip: can't find device 'lo'`**: buildroot's stock S40network configuration, harmless.
