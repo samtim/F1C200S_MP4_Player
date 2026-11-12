@@ -1,0 +1,11 @@
+--- a/libfaad/common.h
++++ b/libfaad/common.h
+@@ -68,7 +68,7 @@
+ /* use double precision */
+ /* #define USE_DOUBLE_PRECISION */
+ /* use fixed point reals */
+-//#define FIXED_POINT
++#define FIXED_POINT
+ //#define BIG_IQ_TABLE
+ 
+ /* Use if target platform has address generators with autoincrement */

@@ -1,0 +1,36 @@
+# ---- build products -------------------------------------------------------
+*.bin
+*.img
+*.jffs2
+*.dtb
+*.o
+*.a
+*.so
+*.so.*
+*.lo
+*.la
+f1c100s_spiflash_16M.bin
+rootfs.jffs2
+
+# ---- upstream source trees (fetched separately, see README §4.0) ----------
+/u-boot/
+/linux-5.15.y/
+/buildroot-2023.02.3/
+/libcedarc/
+/cedar/
+/buildroot-tiny200/
+/buildroot-epass/
+/rootfs/
+
+# ---- vendor material kept locally, not redistributed ----------------------
+/Firmware/
+/_docs/
+/_tools/
+
+# ---- editors and OS -------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db

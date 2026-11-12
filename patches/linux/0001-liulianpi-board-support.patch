@@ -1,0 +1,137 @@
+diff --git a/arch/arm/boot/dts/suniv-f1c100s-liulianpi-spinor.dts b/arch/arm/boot/dts/suniv-f1c100s-liulianpi-spinor.dts
+index eaf386eba..759827d4e 100755
+--- a/arch/arm/boot/dts/suniv-f1c100s-liulianpi-spinor.dts
++++ b/arch/arm/boot/dts/suniv-f1c100s-liulianpi-spinor.dts
+@@ -31,7 +31,7 @@ chosen {
+ 	};
+ 
+ 	panel: panel {
+-		compatible = "qiaodian,qd43003c0-40", "simple-panel";	// 4.3 inch,480x272
++		compatible = "liulianpi,lcd1024x600", "simple-panel";	// 7 inch,1024x600
+ 		//compatible = "foxlink,fl500wvr00-a0t", "simple-panel";	// 4.3 & 5 inch,800x480
+ 		//compatible = "hongxiangrui,hxr401-40", "simple-panel";	// 480x480
+ 		//compatible = "huadi,hd395004c40-40", "simple-panel";	// 720x720
+@@ -241,8 +241,9 @@ &be0 {
+ 	status = "okay";
+ };
+ 
++/* TVE shares TCON0 with the RGB panel; keep it off so the panel owns the CRTC */
+ &tve0 {
+-	status = "okay";
++	status = "disabled";
+ };
+ 
+ //&rtp {
+diff --git a/drivers/gpu/drm/panel/panel-simple.c b/drivers/gpu/drm/panel/panel-simple.c
+index 17e1aaa70..1ae25e9b3 100644
+--- a/drivers/gpu/drm/panel/panel-simple.c
++++ b/drivers/gpu/drm/panel/panel-simple.c
+@@ -1466,6 +1466,42 @@ static const struct drm_display_mode avic_tm070ddh03_mode = {
+ 	.vtotal = 600 + 17 + 1 + 17,
+ };
+ 
++/*
++ * BI50LA7002-27CD, 7" 1024x600 TTL panel (Shenzhen Bochuangda).
++ * Timing taken from the panel datasheet rev V0, section 6.2:
++ *   clock 51.2 MHz typ, Tht 1344, THFP 160, THBP 160, THS 24        (HS inside THBP)
++ *   Tvt 635, TVFP 12, TVBP 23, TVS 2                                (VS inside TVBP)
++ * MODE pin is normally high  -> DE mode, HS/VS unused.
++ * Data is latched on the falling DCLK edge -> TCON drives on rising edge.
++ */
++static const struct drm_display_mode liulianpi_lcd1024x600_mode = {
++	.clock = 51200,
++	.hdisplay = 1024,
++	.hsync_start = 1024 + 160,      /* THFP  = 160 */
++	.hsync_end = 1024 + 160 + 24,   /* THS   = 24  */
++	.htotal = 1344,                 /* THFP + THBP(160) + active */
++	.vdisplay = 600,
++	.vsync_start = 600 + 12,        /* TVFP  = 12  */
++	.vsync_end = 600 + 12 + 2,      /* TVS   = 2   */
++	.vtotal = 635,                  /* 51.2MHz / (1344*635) = 60.00 Hz */
++	.flags = DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC,
++};
++
++static const struct panel_desc liulianpi_lcd1024x600 = {
++	.modes = &liulianpi_lcd1024x600_mode,
++	.num_modes = 1,
++	.bpc = 8,
++	.size = {
++		.width = 154,
++		.height = 90,
++	},
++	.delay = {
++		.prepare = 20,
++		.enable = 200,
++		.disable = 200,
++	},
++};
++
+ static const struct panel_desc avic_tm070ddh03 = {
+ 	.modes = &avic_tm070ddh03_mode,
+ 	.num_modes = 1,
+@@ -4582,6 +4618,9 @@ static const struct of_device_id platform_of_match[] = {
+ 	}, {
+ 		.compatible = "avic,tm070ddh03",
+ 		.data = &avic_tm070ddh03,
++	}, {
++		.compatible = "liulianpi,lcd1024x600",
++		.data = &liulianpi_lcd1024x600,
+ 	}, {
+ 		.compatible = "bananapi,s070wv20-ct16",
+ 		.data = &bananapi_s070wv20_ct16,
+diff --git a/drivers/gpu/drm/sun4i/sun4i_backend.c b/drivers/gpu/drm/sun4i/sun4i_backend.c
+index bf8cfefa0..6566c5fd4 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.c
+@@ -333,7 +333,14 @@ static int sun4i_backend_update_yuv_buffer(struct sun4i_backend *backend,
+ {
+ 	/* TODO: Add support for the multi-planar YUV formats */
+ 	DRM_DEBUG_DRIVER("Setting packed YUV buffer address to %pad\n", &paddr);
+-	regmap_write(backend->engine.regs, SUN4I_BACKEND_IYUVADD_REG(0), paddr);
++	/*
++	 * The F1C100s (suniv) packs this register as a bit address, just like
++	 * the RGB LAYFB registers below; mainline programs the A10/A20 byte
++	 * address here, which makes the DE read from 1/8 of the right place
++	 * and show snow for any packed YUV layer.
++	 */
++	regmap_write(backend->engine.regs, SUN4I_BACKEND_IYUVADD_REG(0),
++		     paddr << 3);
+ 
+ 	DRM_DEBUG_DRIVER("Layer line width: %d bits\n", fb->pitches[0] * 8);
+ 	regmap_write(backend->engine.regs, SUN4I_BACKEND_IYUVLINEWIDTH_REG(0),
+diff --git a/drivers/gpu/drm/sun4i/sun4i_drv.c b/drivers/gpu/drm/sun4i/sun4i_drv.c
+index 0cc64c973..2c389f53b 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_drv.c
++++ b/drivers/gpu/drm/sun4i/sun4i_drv.c
+@@ -110,7 +110,10 @@ static int sun4i_drv_bind(struct device *dev)
+ 	if (ret)
+ 		goto finish_poll;
+ 
+-	drm_fbdev_generic_setup(drm, 32);
++	/* 16bpp (RGB565) instead of 32bpp: the fbdev framebuffer is written by
++	 * the CPU on every video frame, so halving the bytes per pixel is a
++	 * direct win on this memory-bandwidth-bound board. */
++	drm_fbdev_generic_setup(drm, 16);
+ 
+ 	dev_set_drvdata(dev, drm);
+ 
+diff --git a/drivers/staging/media/sunxi/Kconfig b/drivers/staging/media/sunxi/Kconfig
+index 4549a1357..0baf561f2 100644
+--- a/drivers/staging/media/sunxi/Kconfig
++++ b/drivers/staging/media/sunxi/Kconfig
+@@ -12,5 +12,6 @@ config VIDEO_SUNXI
+ if VIDEO_SUNXI
+ 
+ source "drivers/staging/media/sunxi/cedrus/Kconfig"
++source "drivers/staging/media/sunxi/cedar/Kconfig"
+ 
+ endif
+diff --git a/drivers/staging/media/sunxi/Makefile b/drivers/staging/media/sunxi/Makefile
+index b87140b0e..e87d74c67 100644
+--- a/drivers/staging/media/sunxi/Makefile
++++ b/drivers/staging/media/sunxi/Makefile
+@@ -1,2 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0
+ obj-$(CONFIG_VIDEO_SUNXI_CEDRUS)	+= cedrus/
++obj-$(CONFIG_VIDEO_SUNXI_CEDAR_VE)	+= cedar/ve/
++obj-$(CONFIG_VIDEO_SUNXI_CEDAR_ION)	+= cedar/ion/

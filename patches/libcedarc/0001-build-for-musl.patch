@@ -1,0 +1,47 @@
+diff --git a/Makefile.am b/Makefile.am
+index 605a5b5..6a16d31 100755
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -1 +1 @@
+-SUBDIRS = base memory vdecoder openmax
++SUBDIRS = base memory vdecoder
+diff --git a/Makefile.inc b/Makefile.inc
+index 37cf6ef..ce4b36c 100755
+--- a/Makefile.inc
++++ b/Makefile.inc
+@@ -1,5 +1,5 @@
+ 
+-CFLAGS_CDCG = -g -Wall -Werror -D_GNU_SOURCE \
++CFLAGS_CDCG = -g -Wall -Wno-error -D_GNU_SOURCE \
+ 			  -Wno-unused-variable \
+ 			  -Wno-unused-but-set-variable \
+ 			  -Wno-unused-result \
+@@ -11,7 +11,7 @@ CFLAGS_CDCG = -g -Wall -Werror -D_GNU_SOURCE \
+ 			  -Wno-strict-aliasing \
+                           -lm
+ 
+-CPPFLAGS_CDCG = -g -Wall -Werror -D_GNU_SOURCE \
++CPPFLAGS_CDCG = -g -Wall -Wno-error -D_GNU_SOURCE \
+ 				-Wno-unused-variable \
+ 				-Wno-unused-but-set-variable \
+ 			    -Wno-unused-value \
+diff --git a/base/include/log.h b/base/include/log.h
+index c5728c9..4c12b10 100755
+--- a/base/include/log.h
++++ b/base/include/log.h
+@@ -55,8 +55,14 @@
+ #define LOG_LEVEL_VERBOSE   "verbose"
+ #define LOG_LEVEL_DEBUG     "debug  "
+ 
++/* only error/warning survive: everything else is far too chatty on a
++ * 115200 baud console */
+ #define AWLOG(level, fmt, arg...)  \
+-    printf("%s: %s <%s:%u>:" fmt "\n", level, LOG_TAG, __FUNCTION__, __LINE__, ##arg)
++    do { \
++        if ((level)[0] == 'e' || (level)[0] == 'w') \
++            printf("%s: %s <%s:%u>:" fmt "\n", level, LOG_TAG, \
++                   __FUNCTION__, __LINE__, ##arg); \
++    } while (0)
+ 
+ #define CC_LOG_ASSERT(e, fmt, arg...)                                       \
+                 do {                                                        \
